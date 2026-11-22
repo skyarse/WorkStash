@@ -1,5 +1,5 @@
 use anyhow::{bail, ensure, Context, Result};
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::Value;
 use std::{
     collections::BTreeSet,
@@ -44,7 +44,9 @@ impl Library {
               id INTEGER PRIMARY KEY, section INTEGER NOT NULL REFERENCES sections(id),
               kind TEXT NOT NULL,title TEXT NOT NULL,body TEXT NOT NULL DEFAULT '',
               asset TEXT,source TEXT UNIQUE,token TEXT NOT NULL UNIQUE DEFAULT (lower(hex(randomblob(16))))
-            ); COMMIT;")?;
+            );
+            CREATE TABLE IF NOT EXISTS drafts(slot TEXT PRIMARY KEY,section INTEGER NOT NULL,kind TEXT NOT NULL,title TEXT NOT NULL,body TEXT NOT NULL);
+            COMMIT;")?;
         Ok(Self { root, db })
     }
     pub fn sections(&self) -> Result<Vec<(i64, String)>> {
@@ -78,6 +80,48 @@ impl Library {
         })?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
+    pub fn move_entries(&mut self, ids: &[i64], section: i64) -> Result<()> {
+        let tx = self.db.transaction()?;
+        for id in ids {
+            ensure!(
+                tx.execute(
+                    "UPDATE entries SET section=? WHERE id=?",
+                    params![section, id]
+                )? == 1,
+                "Запись недоступна"
+            );
+            tx.execute(
+                "UPDATE drafts SET section=? WHERE slot=?",
+                params![section, format!("edit/{id}")],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+    pub fn draft(&self, slot: &str) -> Result<Option<(i64, String, String, String)>> {
+        Ok(self
+            .db
+            .query_row(
+                "SELECT section,kind,title,body FROM drafts WHERE slot=?",
+                [slot],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .optional()?)
+    }
+    pub fn keep_draft(
+        &self,
+        slot: &str,
+        section: i64,
+        kind: &str,
+        title: &str,
+        body: &str,
+    ) -> Result<()> {
+        self.db.execute(
+            "INSERT OR REPLACE INTO drafts(slot,section,kind,title,body) VALUES (?,?,?,?,?)",
+            params![slot, section, kind, title, body],
+        )?;
+        Ok(())
+    }
     pub fn save_text(
         &self,
         id: Option<i64>,
@@ -87,15 +131,21 @@ impl Library {
         body: &str,
     ) -> Result<i64> {
         ensure!(!title.trim().is_empty(), "Введите название");
-        if let Some(id) = id {
-            ensure!(self.db.execute("UPDATE entries SET title=?,body=?,section=? WHERE id=? AND kind IN ('Заметка','Промпт','Credential')",params![title.trim(),body,section,id])?==1,"Запись недоступна");
-            return Ok(id);
-        }
-        self.db.execute(
-            "INSERT INTO entries(section,kind,title,body) VALUES(?,?,?,?)",
-            params![section, kind, title.trim(), body],
-        )?;
-        Ok(self.db.last_insert_rowid())
+        let tx = self.db.unchecked_transaction()?;
+        let saved = if let Some(id) = id {
+            ensure!(tx.execute("UPDATE entries SET title=?,body=?,section=?,kind=? WHERE id=? AND ((kind IN ('Заметка','Промпт') AND ? IN ('Заметка','Промпт')) OR (kind='Credential' AND ?='Credential'))", params![title.trim(),body,section,kind,id,kind,kind])?==1,"Запись недоступна");
+            id
+        } else {
+            tx.execute(
+                "INSERT INTO entries(section,kind,title,body) VALUES(?,?,?,?)",
+                params![section, kind, title.trim(), body],
+            )?;
+            tx.last_insert_rowid()
+        };
+        let slot = draft_slot(id, kind);
+        tx.execute("DELETE FROM drafts WHERE slot=?", [slot])?;
+        tx.commit()?;
+        Ok(saved)
     }
     pub fn import(&self, section: i64, path: &Path) -> Result<()> {
         let meta = fs::symlink_metadata(path)?;
@@ -193,6 +243,14 @@ impl Library {
             ON CONFLICT(source) DO UPDATE SET title=excluded.title,body=excluded.body,asset=excluded.asset",params![section,kind,title,body,source,relative])?;
         let _ = stage.keep();
         Ok(())
+    }
+}
+
+pub fn draft_slot(id: Option<i64>, kind: &str) -> String {
+    match id {
+        Some(id) => format!("edit/{id}"),
+        None if kind == "Credential" => "new/access".into(),
+        None => "new/text".into(),
     }
 }
 
@@ -321,6 +379,42 @@ mod editing_tests {
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].body, "новый текст");
         assert_eq!(entries[0].section, section);
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod organization_tests {
+    use super::*;
+    #[test]
+    fn drafts_survive_reopen_and_moves_commit_together() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let lib = Library::open(dir.path())?;
+        let section = lib.add_section("Проект")?;
+        let text = lib.save_text(None, 1, "Промпт", "Первый", "Текст")?;
+        let second = lib.save_text(None, 1, "Заметка", "Второй", "")?;
+        let slot = draft_slot(Some(text), "Промпт");
+        lib.keep_draft(&slot, 1, "Заметка", "Черновик", "Продолжение")?;
+        let new_slot = draft_slot(None, "Заметка");
+        lib.keep_draft(&new_slot, section, "Промпт", "Новый", "Черновой текст")?;
+        drop(lib);
+        let mut lib = Library::open(dir.path())?;
+        assert_eq!(lib.draft(&new_slot)?.unwrap().3, "Черновой текст");
+        assert!(lib.move_entries(&[text, i64::MAX], section).is_err());
+        assert!(lib.entries()?.iter().all(|e| e.section == 1));
+        lib.move_entries(&[text], section)?;
+        let (dest, kind, title, body) = lib.draft(&slot)?.unwrap();
+        assert_eq!(dest, section);
+        lib.save_text(Some(text), dest, &kind, &title, &body)?;
+        assert!(lib.draft(&slot)?.is_none());
+        assert!(lib
+            .entries()?
+            .iter()
+            .any(|e| e.id == text && e.kind == "Заметка" && e.body == "Продолжение"));
+        lib.move_entries(&[text, second], section)?;
+        assert!(lib.entries()?.iter().all(|e| e.section == section));
+        lib.save_text(None, section, "Промпт", "Новый", "Готово")?;
+        assert!(lib.draft(&new_slot)?.is_none());
         Ok(())
     }
 }

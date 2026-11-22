@@ -6,7 +6,9 @@ Keep notes, prompts, AI skills, n8n workflows and project files together in a lo
 
 In the **Actions** tab, open a successful **Fedora development build** run on `dev`. Download the **WorkStash-Fedora44-x86_64** artifact while signed in, extract the RPM and install it using the Fedora package installer. Open **WorkStash** from the application menu. There is no stable release yet.
 
-Choose a directory on your disk. WorkStash creates a private `WorkStash.library` folder there and remembers its location. Create a section or use the inbox, then drop a file or folder into the window. Select an entry to read it or locate the saved copy. Use **+ Добавить** to create notes, prompts or access cards and to import files or folders. Tabs filter the selected section by material type. **Настройки → Тема оформления** follows the desktop by default and remembers an explicit light or dark choice.
+Choose a directory on your disk. WorkStash creates a private `WorkStash.library` folder there and remembers its location. Create a section or use **Входящие** to collect materials for later sorting. New imports from **Все материалы** go to the inbox. Drop a file or folder into the window. Select an entry to read it or locate the saved copy. Under **+ Добавить**, choose **Текстовая запись** for a note and tick **Промпт** for reusable prompt text. Use **Скопировать** in the details to copy the text. Access cards have their own editor. Click outside a panel or press Escape to close it. Reopen the same editor to continue a draft after closing the panel or restarting WorkStash. Tabs filter the selected section by material type. **Настройки → Тема оформления** follows the desktop by default and remembers an explicit light or dark choice.
+
+Open an item and choose **Переместить в раздел…** to move it. For several items, click **Выбрать**, tick individual rows or **Все в списке**, then choose the destination. Selection applies to the current search and type filter.
 
 ## Imports and search
 

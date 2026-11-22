@@ -1,14 +1,17 @@
 mod appearance;
 mod desktop;
 mod library;
+mod panel;
 mod remote;
 mod table;
 
 use anyhow::{Context, Result};
 use eframe::egui::{self, Color32, RichText};
 use library::{Entry, Library};
+use panel::{OpenPanel, Panel};
 use remote::{Choice, Remote, Resource, Snapshot};
 use std::{
+    collections::BTreeSet,
     fs,
     path::{Path, PathBuf},
     process::Command,
@@ -17,7 +20,9 @@ use std::{
 };
 
 fn kind_name(kind: &str) -> &str {
-    if kind == "Credential" {
+    if kind == "Заметка" {
+        "Текстовая запись"
+    } else if kind == "Credential" {
         "Карточка доступа"
     } else {
         kind
@@ -26,7 +31,7 @@ fn kind_name(kind: &str) -> &str {
 fn tab_name(kind: &str) -> &str {
     match kind {
         "Таблица" => "Таблицы",
-        "Заметка" => "Заметки",
+        "Заметка" => "Текстовые записи",
         "Промпт" => "Промпты",
         "Credential" => "Доступы",
         "Навык" => "Навыки",
@@ -57,6 +62,7 @@ struct ServerPanel {
     base: String,
     key: String,
     kind: Resource,
+    destination: i64,
     choices: Vec<Choice>,
     job: Option<mpsc::Receiver<Result<Reply>>>,
 }
@@ -66,6 +72,7 @@ impl Default for ServerPanel {
             base: String::new(),
             key: String::new(),
             kind: Resource::Workflow,
+            destination: 1,
             choices: Vec::new(),
             job: None,
         }
@@ -91,7 +98,10 @@ impl ServerPanel {
 #[derive(Default)]
 struct App {
     appearance: Option<appearance::Appearance>,
-    settings_open: bool,
+    panel: Option<OpenPanel>,
+    selecting: bool,
+    marked: BTreeSet<i64>,
+    moving: Vec<i64>,
     kind_filter: Option<String>,
     table: Option<(String, Result<table::Table>)>,
     library: Option<Library>,
@@ -101,7 +111,7 @@ struct App {
     selected: Option<i64>,
     query: String,
     section_name: String,
-    adding_section: bool,
+
     draft: Option<Draft>,
     secret: String,
     server: Option<ServerPanel>,
@@ -134,6 +144,10 @@ impl App {
         self.section = None;
         self.kind_filter = None;
         self.table = None;
+        self.panel = None;
+        self.selecting = false;
+        self.marked.clear();
+        self.moving.clear();
         self.draft = None;
         self.server = None;
         self.secret.clear();
@@ -189,13 +203,49 @@ impl App {
         Ok(())
     }
     fn new_draft(&mut self, kind: &str) {
-        self.draft = Some(Draft {
+        self.open_draft(Draft {
             id: None,
             section: self.section.unwrap_or(1),
             kind: kind.into(),
             title: String::new(),
             body: String::new(),
         });
+    }
+    fn open_draft(&mut self, mut draft: Draft) {
+        let slot = library::draft_slot(draft.id, &draft.kind);
+        match self.library.as_ref().unwrap().draft(&slot) {
+            Ok(Some((section, kind, title, body))) => {
+                draft.section = section;
+                draft.kind = kind;
+                draft.title = title;
+                draft.body = body;
+            }
+            Ok(None) => {}
+            Err(err) => {
+                self.status = format!("{err:#}");
+                self.panel = None;
+                return;
+            }
+        }
+        self.draft = Some(draft);
+        if let Some(panel) = &mut self.panel {
+            panel.kind = Panel::Editor;
+        }
+    }
+    fn trigger(&mut self, r: &egui::Response, kind: Panel) {
+        if let Some(panel) = &mut self.panel {
+            panel.track(r);
+        }
+        if r.clicked() {
+            let closing = self
+                .panel
+                .is_some_and(|p| p.kind == kind && p.anchored_at(r));
+            self.panel = if closing {
+                None
+            } else {
+                Some(OpenPanel::at(kind, r))
+            };
+        }
     }
     fn sidebar(&mut self, ui: &mut egui::Ui) {
         ui.heading("WorkStash");
@@ -207,6 +257,8 @@ impl App {
             self.section = None;
             self.selected = None;
             self.kind_filter = None;
+            self.marked.clear();
+            self.selecting = false;
             self.secret.clear();
         }
         ui.add_space(12.);
@@ -219,40 +271,20 @@ impl App {
                 self.section = Some(*id);
                 self.selected = None;
                 self.kind_filter = None;
+                self.marked.clear();
+                self.selecting = false;
                 self.secret.clear();
             }
         }
-        if ui.small_button("+ Раздел").clicked() {
-            self.adding_section = true;
-        }
-        if self.adding_section {
-            ui.text_edit_singleline(&mut self.section_name);
-            if ui.button("Создать раздел").clicked() {
-                let result = self
-                    .library
-                    .as_ref()
-                    .unwrap()
-                    .add_section(&self.section_name)
-                    .and_then(|id| {
-                        self.section = Some(id);
-                        self.selected = None;
-                        self.kind_filter = None;
-                        self.secret.clear();
-                        self.section_name.clear();
-                        self.adding_section = false;
-                        self.reload()
-                    });
-                self.report(result);
-            }
-        }
+        let button = ui.small_button("+ Раздел");
+        self.trigger(&button, Panel::Section);
         ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
             if ui.button("Сменить библиотеку…").clicked() {
                 let r = self.choose_library();
                 self.report(r);
             }
-            if ui.button("Настройки…").clicked() {
-                self.settings_open = true;
-            }
+            let button = ui.button("Настройки…");
+            self.trigger(&button, Panel::Settings);
         });
     }
     fn catalog(&mut self, ui: &mut egui::Ui) {
@@ -265,34 +297,12 @@ impl App {
                 .unwrap_or("Все материалы");
             ui.heading(section);
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.menu_button("+ Добавить", |ui| {
-                    ui.label(RichText::new("Создать").small());
-                    for kind in ["Заметка", "Промпт", "Credential"] {
-                        if ui.button(kind_name(kind)).clicked() {
-                            ui.close_menu();
-                            self.new_draft(kind);
-                        }
-                    }
-                    ui.separator();
-                    ui.label(RichText::new("Импортировать").small());
-                    for (label, folder) in [("Файл…", false), ("Папку…", true)] {
-                        if ui.button(label).clicked() {
-                            ui.close_menu();
-                            let r = desktop::choose(folder).and_then(|path| {
-                                if let Some(path) = path {
-                                    self.import(vec![path])
-                                } else {
-                                    Ok(())
-                                }
-                            });
-                            self.report(r);
-                        }
-                    }
-                    if ui.button("Из n8n…").clicked() {
-                        ui.close_menu();
-                        self.server.get_or_insert_with(Default::default);
-                    }
-                });
+                let button = ui.button("+ Добавить");
+                self.trigger(&button, Panel::Add);
+                if ui.selectable_label(self.selecting, "Выбрать").clicked() {
+                    self.selecting = !self.selecting;
+                    self.marked.clear();
+                }
             });
         });
         ui.add_space(8.);
@@ -342,24 +352,61 @@ impl App {
         }
         ui.separator();
         let q = self.query.trim().to_lowercase();
+        let visible: BTreeSet<_> = self
+            .entries
+            .iter()
+            .filter(|e| {
+                self.section.is_none_or(|s| s == e.section)
+                    && self.kind_filter.as_ref().is_none_or(|k| k == &e.kind)
+                    && (q.is_empty()
+                        || [&e.title, &e.kind, &e.body]
+                            .iter()
+                            .any(|v| v.to_lowercase().contains(&q))
+                        || kind_name(&e.kind).to_lowercase().contains(&q))
+            })
+            .map(|e| e.id)
+            .collect();
+        self.marked.retain(|id| visible.contains(id));
+        if self.selecting {
+            ui.horizontal_wrapped(|ui| {
+                let mut all = !visible.is_empty() && self.marked == visible;
+                if ui.checkbox(&mut all, "Все в списке").changed() {
+                    self.marked = if all {
+                        visible.clone()
+                    } else {
+                        BTreeSet::new()
+                    };
+                }
+                let button = ui.add_enabled(
+                    !self.marked.is_empty(),
+                    egui::Button::new(format!("Переместить в раздел… ({})", self.marked.len())),
+                );
+                if button.clicked() {
+                    self.moving = self.marked.iter().copied().collect();
+                }
+                self.trigger(&button, Panel::Move);
+            });
+        }
         let mut any = false;
         egui::ScrollArea::vertical()
             .id_salt("catalog")
             .show(ui, |ui| {
                 for e in &self.entries {
-                    if self.section.is_some_and(|s| s != e.section)
-                        || self.kind_filter.as_ref().is_some_and(|k| k != &e.kind)
-                        || !(q.is_empty()
-                            || e.title.to_lowercase().contains(&q)
-                            || kind_name(&e.kind).to_lowercase().contains(&q)
-                            || e.kind.to_lowercase().contains(&q)
-                            || e.body.to_lowercase().contains(&q))
-                    {
+                    if !visible.contains(&e.id) {
                         continue;
                     }
                     any = true;
                     ui.label(RichText::new(kind_name(&e.kind)).small());
-                    if ui
+                    if self.selecting {
+                        let mut checked = self.marked.contains(&e.id);
+                        if ui.checkbox(&mut checked, &e.title).changed() {
+                            if checked {
+                                self.marked.insert(e.id);
+                            } else {
+                                self.marked.remove(&e.id);
+                            }
+                        }
+                    } else if ui
                         .selectable_label(
                             self.selected == Some(e.id),
                             RichText::new(&e.title).size(17.),
@@ -387,20 +434,35 @@ impl App {
         ui.label(RichText::new(kind_name(&e.kind)));
         ui.heading(&e.title);
         ui.add_space(10.);
-        if ["Заметка", "Промпт", "Credential"].contains(&e.kind.as_str())
-            && ui.button("Редактировать").clicked()
-        {
-            self.draft = Some(Draft {
-                id: Some(e.id),
-                section: e.section,
-                kind: e.kind.clone(),
-                title: e.title.clone(),
-                body: e.body.clone(),
-            });
+        let id = e.id;
+        let move_button = ui.button("Переместить в раздел…");
+        if move_button.clicked() {
+            self.moving = vec![id];
         }
-        if e.kind == "Промпт" && ui.button("Скопировать промпт").clicked() {
+        self.trigger(&move_button, Panel::Move);
+        let e = self.entries.iter().find(|e| e.id == id).unwrap();
+        if ["Заметка", "Промпт", "Credential"].contains(&e.kind.as_str()) {
+            let button = ui.button("Редактировать");
+            if let Some(panel) = &mut self.panel {
+                panel.track(&button);
+            }
+            if button.clicked() {
+                let draft = Draft {
+                    id: Some(id),
+                    section: e.section,
+                    kind: e.kind.clone(),
+                    title: e.title.clone(),
+                    body: e.body.clone(),
+                };
+                self.panel = Some(OpenPanel::at(Panel::Editor, &button));
+                self.open_draft(draft);
+                return;
+            }
+        }
+        if ["Заметка", "Промпт"].contains(&e.kind.as_str()) && ui.button("Скопировать").clicked()
+        {
             ctx.copy_text(e.body.clone());
-            self.status = "Промпт скопирован".into();
+            self.status = "Текст скопирован".into();
         }
         if let Some(relative) = &e.asset {
             let root = &self.library.as_ref().unwrap().root;
@@ -500,44 +562,68 @@ impl App {
             ui.label(&e.body);
         });
     }
-    fn editor(&mut self, ctx: &egui::Context) {
+    fn editor(&mut self, ui: &mut egui::Ui) {
         let Some(d) = self.draft.as_mut() else { return };
-        let mut save = false;
-        let mut open = true;
-        egui::Window::new(format!("{} · запись", kind_name(&d.kind)))
-            .open(&mut open)
-            .collapsible(false)
-            .default_width(450.)
-            .show(ctx, |ui| {
-                ui.label("Название");
-                ui.text_edit_singleline(&mut d.title);
-                egui::ComboBox::from_label("Раздел")
-                    .selected_text(
-                        self.sections
-                            .iter()
-                            .find(|s| s.0 == d.section)
-                            .map(|s| &*s.1)
-                            .unwrap_or(""),
-                    )
-                    .show_ui(ui, |ui| {
-                        for (id, name) in &self.sections {
-                            ui.selectable_value(&mut d.section, *id, name);
-                        }
-                    });
-                ui.label(if d.kind == "Credential" {
-                    "Описание доступа (секрет добавляется отдельно)"
+        ui.heading(if d.kind == "Credential" {
+            "Карточка доступа"
+        } else {
+            "Текстовая запись"
+        });
+        ui.label("Название");
+        let mut changed = ui.text_edit_singleline(&mut d.title).changed();
+        if d.kind != "Credential" {
+            let mut prompt = d.kind == "Промпт";
+            if ui.checkbox(&mut prompt, "Промпт").changed() {
+                d.kind = if prompt {
+                    "Промпт"
                 } else {
-                    "Текст"
-                });
-                ui.add(
-                    egui::TextEdit::multiline(&mut d.body)
-                        .desired_rows(9)
-                        .desired_width(f32::INFINITY),
-                );
-                save = ui
-                    .add_enabled(!d.title.trim().is_empty(), egui::Button::new("Сохранить"))
-                    .clicked();
-            });
+                    "Заметка"
+                }
+                .into();
+                changed = true;
+            }
+        }
+        ui.collapsing(
+            format!(
+                "Раздел · {}",
+                self.sections
+                    .iter()
+                    .find(|s| s.0 == d.section)
+                    .map(|s| s.1.as_str())
+                    .unwrap_or("")
+            ),
+            |ui| {
+                for (id, name) in &self.sections {
+                    changed |= ui.selectable_value(&mut d.section, *id, name).changed();
+                }
+            },
+        );
+        ui.label(if d.kind == "Credential" {
+            "Описание доступа (секрет добавляется отдельно)"
+        } else {
+            "Текст"
+        });
+        changed |= ui
+            .add(
+                egui::TextEdit::multiline(&mut d.body)
+                    .desired_rows(9)
+                    .desired_width(f32::INFINITY),
+            )
+            .changed();
+        if changed {
+            let slot = library::draft_slot(d.id, &d.kind);
+            if let Err(err) = self
+                .library
+                .as_ref()
+                .unwrap()
+                .keep_draft(&slot, d.section, &d.kind, &d.title, &d.body)
+            {
+                self.status = format!("Не удалось сохранить черновик: {err:#}");
+            }
+        }
+        let save = ui
+            .add_enabled(!d.title.trim().is_empty(), egui::Button::new("Сохранить"))
+            .clicked();
         if save {
             match self
                 .library
@@ -551,22 +637,81 @@ impl App {
                     self.selected = Some(id);
                     self.secret.clear();
                     self.query.clear();
-                    open = false;
+                    self.panel = None;
+                    self.draft = None;
                     let r = self.reload();
                     self.report(r);
                 }
                 Err(e) => self.status = format!("{e:#}"),
             }
         }
-        if !open {
-            self.draft = None;
-        }
     }
-    fn server_panel(&mut self, ctx: &egui::Context) {
+    fn server_panel(&mut self, ui: &mut egui::Ui) {
+        let ctx = ui.ctx().clone();
         let Some(p) = self.server.as_mut() else {
             return;
         };
-        let mut open = true;
+        ui.heading("Импорт из n8n");
+        ui.add_enabled_ui(p.job.is_none(), |ui| {
+            ui.label("Адрес сервера");
+            if ui
+                .add(egui::TextEdit::singleline(&mut p.base).hint_text("https://n8n.example.org"))
+                .changed()
+            {
+                p.choices.clear();
+            }
+            ui.label("API key · только для этого подключения");
+            if ui
+                .add(egui::TextEdit::singleline(&mut p.key).password(true))
+                .changed()
+            {
+                p.choices.clear();
+            }
+            ui.horizontal(|ui| {
+                for (k, name) in [
+                    (Resource::Workflow, "Workflow"),
+                    (Resource::Table, "Data Tables"),
+                ] {
+                    if ui.selectable_value(&mut p.kind, k, name).changed() {
+                        p.choices.clear();
+                    }
+                }
+            });
+            if ui.button("Загрузить список").clicked() {
+                p.choices.clear();
+                if let Err(e) = p.start(None, ctx.clone()) {
+                    self.status = format!("{e:#}")
+                }
+            }
+            let mut chosen = None;
+            egui::ScrollArea::vertical()
+                .max_height(260.)
+                .show(ui, |ui| {
+                    for row in &p.choices {
+                        if ui
+                            .button(&row.name)
+                            .on_hover_text("Сохранить или обновить локальную копию")
+                            .clicked()
+                        {
+                            chosen = Some(row.id.clone())
+                        }
+                    }
+                });
+            if let Some(id) = chosen {
+                p.destination = self.section.unwrap_or(1);
+                if let Err(e) = p.start(Some(id), ctx.clone()) {
+                    self.status = format!("{e:#}")
+                }
+            }
+        });
+        if p.job.is_some() {
+            ui.spinner();
+        }
+    }
+    fn poll_server(&mut self) {
+        let Some(p) = self.server.as_mut() else {
+            return;
+        };
         let mut received = None;
         if let Some(rx) = &p.job {
             match rx.try_recv() {
@@ -581,68 +726,6 @@ impl App {
                 _ => {}
             }
         }
-        egui::Window::new("Импорт из n8n")
-            .open(&mut open)
-            .collapsible(false)
-            .show(ctx, |ui| {
-                ui.add_enabled_ui(p.job.is_none(), |ui| {
-                    ui.label("Адрес сервера");
-                    if ui
-                        .add(
-                            egui::TextEdit::singleline(&mut p.base)
-                                .hint_text("https://n8n.example.org"),
-                        )
-                        .changed()
-                    {
-                        p.choices.clear();
-                    }
-                    ui.label("API key · только для этого подключения");
-                    if ui
-                        .add(egui::TextEdit::singleline(&mut p.key).password(true))
-                        .changed()
-                    {
-                        p.choices.clear();
-                    }
-                    ui.horizontal(|ui| {
-                        for (k, name) in [
-                            (Resource::Workflow, "Workflow"),
-                            (Resource::Table, "Data Tables"),
-                        ] {
-                            if ui.selectable_value(&mut p.kind, k, name).changed() {
-                                p.choices.clear();
-                            }
-                        }
-                    });
-                    if ui.button("Загрузить список").clicked() {
-                        p.choices.clear();
-                        if let Err(e) = p.start(None, ctx.clone()) {
-                            self.status = format!("{e:#}")
-                        }
-                    }
-                    let mut chosen = None;
-                    egui::ScrollArea::vertical()
-                        .max_height(260.)
-                        .show(ui, |ui| {
-                            for row in &p.choices {
-                                if ui
-                                    .button(&row.name)
-                                    .on_hover_text("Сохранить или обновить локальную копию")
-                                    .clicked()
-                                {
-                                    chosen = Some(row.id.clone())
-                                }
-                            }
-                        });
-                    if let Some(id) = chosen {
-                        if let Err(e) = p.start(Some(id), ctx.clone()) {
-                            self.status = format!("{e:#}")
-                        }
-                    }
-                });
-                if p.job.is_some() {
-                    ui.spinner();
-                }
-            });
         match received {
             Some(Ok(Reply::List(rows))) => {
                 self.status = format!("Найдено: {}", rows.len());
@@ -653,13 +736,7 @@ impl App {
                     .library
                     .as_ref()
                     .unwrap()
-                    .snapshot(
-                        self.section.unwrap_or(1),
-                        s.kind.label(),
-                        &s.source,
-                        &s.title,
-                        &s.value,
-                    )
+                    .snapshot(p.destination, s.kind.label(), &s.source, &s.title, &s.value)
                     .and_then(|_| self.reload());
                 if r.is_ok() {
                     self.status = format!("Сохранено: {}", s.title)
@@ -669,25 +746,115 @@ impl App {
             Some(Err(e)) => self.status = format!("{e:#}"),
             None => {}
         }
-        if !open {
-            self.server = None
+        if !self.panel.is_some_and(|p| p.kind == Panel::Server)
+            && self.server.as_ref().is_some_and(|s| s.job.is_none())
+        {
+            self.server = None;
         }
     }
-}
-impl eframe::App for App {
-    fn update(&mut self, ctx: &egui::Context, _: &mut eframe::Frame) {
+    fn popup(&mut self, ctx: &egui::Context) {
+        let Some(open) = self.panel else { return };
+        let bounds = open.draw(ctx, |ui| match open.kind {
+            Panel::Add => {
+                ui.label(RichText::new("Создать").small());
+                for kind in ["Заметка", "Credential"] {
+                    if ui.button(kind_name(kind)).clicked() {
+                        self.new_draft(kind);
+                    }
+                }
+                ui.separator();
+                ui.label(RichText::new("Импортировать").small());
+                for (label, folder) in [("Файл…", false), ("Папку…", true)] {
+                    if ui.button(label).clicked() {
+                        self.panel = None;
+                        let r = desktop::choose(folder).and_then(|path| {
+                            if let Some(path) = path {
+                                self.import(vec![path])
+                            } else {
+                                Ok(())
+                            }
+                        });
+                        self.report(r);
+                    }
+                }
+                if ui.button("Из n8n…").clicked() {
+                    self.server.get_or_insert_with(Default::default);
+                    self.panel.as_mut().unwrap().kind = Panel::Server;
+                }
+            }
+            Panel::Settings => {
+                if let Some(a) = &mut self.appearance {
+                    let r = a.settings(ui);
+                    self.report(r);
+                }
+            }
+            Panel::Editor => self.editor(ui),
+            Panel::Server => self.server_panel(ui),
+            Panel::Section => {
+                ui.text_edit_singleline(&mut self.section_name);
+                if ui.button("Создать раздел").clicked() {
+                    let result = self
+                        .library
+                        .as_ref()
+                        .unwrap()
+                        .add_section(&self.section_name)
+                        .and_then(|id| {
+                            self.section = Some(id);
+                            self.selected = None;
+                            self.kind_filter = None;
+                            self.secret.clear();
+                            self.section_name.clear();
+                            self.panel = None;
+                            self.marked.clear();
+                            self.selecting = false;
+                            self.reload()
+                        });
+                    self.report(result);
+                }
+            }
+            Panel::Move => {
+                ui.strong("Переместить в раздел");
+                let mut target = None;
+                for (id, name) in &self.sections {
+                    if ui.button(name).clicked() {
+                        target = Some(*id);
+                    }
+                }
+                if let Some(id) = target {
+                    let r = self
+                        .library
+                        .as_mut()
+                        .unwrap()
+                        .move_entries(&self.moving, id)
+                        .and_then(|_| self.reload());
+                    if r.is_ok() {
+                        self.status = format!("Перемещено записей: {}", self.moving.len());
+                        self.panel = None;
+                        self.marked.clear();
+                        self.selected = None;
+                        self.secret.clear();
+                        self.selecting = false;
+                    }
+                    self.report(r);
+                }
+            }
+        });
+        if let Some(current) = &mut self.panel {
+            if current.kind == open.kind {
+                current.record_bounds(bounds);
+            } else {
+                ctx.request_repaint();
+            }
+        }
+    }
+    fn show(&mut self, ctx: &egui::Context) {
         if let Some(appearance) = &mut self.appearance {
             appearance.apply(ctx);
-            egui::Window::new("Настройки")
-                .open(&mut self.settings_open)
-                .collapsible(false)
-                .resizable(false)
-                .show(ctx, |ui| {
-                    if let Err(err) = appearance.settings(ui) {
-                        self.status = format!("Не удалось сохранить тему: {err:#}");
-                    }
-                });
         }
+        if self.panel.is_some_and(|p| p.should_close(ctx)) {
+            self.panel = None;
+        }
+        self.poll_server();
         if !self.status.is_empty() {
             egui::TopBottomPanel::bottom("status").show(ctx, |ui| {
                 ui.horizontal_wrapped(|ui| {
@@ -704,9 +871,8 @@ impl eframe::App for App {
                     ui.add_space(100.);
                     ui.heading("WorkStash");
                     ui.add_space(16.);
-                    if ui.button("Настройки…").clicked() {
-                        self.settings_open = true;
-                    }
+                    let r = ui.button("Настройки…");
+                    self.trigger(&r, Panel::Settings);
                     ui.label("Выберите папку для новой или существующей библиотеки.");
                     if ui.button("Выбрать папку…").clicked() {
                         let r = self.choose_library();
@@ -714,6 +880,7 @@ impl eframe::App for App {
                     }
                 });
             });
+            self.popup(ctx);
             return;
         }
         let paths: Vec<_> = ctx.input(|i| {
@@ -737,8 +904,12 @@ impl eframe::App for App {
                 .show(ctx, |ui| self.details(ui, ctx));
         }
         egui::CentralPanel::default().show(ctx, |ui| self.catalog(ui));
-        self.editor(ctx);
-        self.server_panel(ctx);
+        self.popup(ctx);
+    }
+}
+impl eframe::App for App {
+    fn update(&mut self, ctx: &egui::Context, _: &mut eframe::Frame) {
+        self.show(ctx);
     }
 }
 fn main() -> eframe::Result {
@@ -783,7 +954,7 @@ mod ui_tests {
             ..Default::default()
         };
         ctx.run(input, |ctx| {
-            egui::CentralPanel::default().show(ctx, |ui| app.catalog(ui));
+            app.show(ctx);
         })
         .shapes
         .into_iter()
@@ -800,6 +971,69 @@ mod ui_tests {
         .collect()
     }
 
+    fn click(app: &mut App, ctx: &egui::Context, pos: egui::Pos2) {
+        for pressed in [true, false] {
+            catalog_frame(
+                app,
+                ctx,
+                vec![
+                    egui::Event::PointerMoved(pos),
+                    egui::Event::PointerButton {
+                        pos,
+                        button: egui::PointerButton::Primary,
+                        pressed,
+                        modifiers: Default::default(),
+                    },
+                ],
+            );
+        }
+        catalog_frame(app, ctx, vec![]);
+    }
+
+    #[test]
+    fn panels_follow_buttons_and_switch_on_first_click() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let ctx = egui::Context::default();
+        let mut app = App::default();
+        app.load(dir.path())?;
+        let labels = catalog_frame(&mut app, &ctx, vec![]);
+        let point = |name: &str| labels.iter().find(|(s, _)| s == name).unwrap().1;
+        let settings = point("Настройки…");
+        click(&mut app, &ctx, settings);
+        assert_eq!(app.panel.unwrap().kind, Panel::Settings);
+        let rect = ctx
+            .memory(|m| m.area_rect(egui::Id::new(("workstash-panel", Panel::Settings as u8))))
+            .unwrap();
+        assert!(rect.bottom() < settings.y && settings.y - rect.bottom() < 35.);
+        click(&mut app, &ctx, point("+ Добавить"));
+        assert_eq!(app.panel.unwrap().kind, Panel::Add);
+        let menu = catalog_frame(&mut app, &ctx, vec![]);
+        let text = menu
+            .iter()
+            .find(|(s, _)| s == "Текстовая запись")
+            .unwrap()
+            .1;
+        click(&mut app, &ctx, text);
+        assert_eq!(app.panel.unwrap().kind, Panel::Editor);
+        click(&mut app, &ctx, settings);
+        assert_eq!(app.panel.unwrap().kind, Panel::Settings);
+        click(&mut app, &ctx, egui::pos2(550., 530.));
+        assert!(app.panel.is_none());
+        click(&mut app, &ctx, point("+ Добавить"));
+        catalog_frame(
+            &mut app,
+            &ctx,
+            vec![egui::Event::Key {
+                key: egui::Key::Escape,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: Default::default(),
+            }],
+        );
+        assert!(app.panel.is_none());
+        Ok(())
+    }
     #[test]
     fn table_tab_filters_existing_workflow_and_search() -> Result<()> {
         let dir = tempfile::tempdir()?;
