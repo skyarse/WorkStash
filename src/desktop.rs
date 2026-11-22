@@ -7,13 +7,19 @@ use std::{
     process::{Command, Stdio},
 };
 
-pub fn choose(folder: bool) -> Result<Option<PathBuf>> {
+pub enum Picker {
+    File,
+    Folder,
+    Joplin,
+}
+pub fn choose(picker: Picker) -> Result<Option<PathBuf>> {
+    let args: &[&str] = match picker {
+        Picker::File => &["--getopenfilename"],
+        Picker::Folder => &["--getexistingdirectory"],
+        Picker::Joplin => &["--getopenfilename", ".", "Архив Joplin (*.jex *.JEX)"],
+    };
     let r = Command::new("kdialog")
-        .arg(if folder {
-            "--getexistingdirectory"
-        } else {
-            "--getopenfilename"
-        })
+        .args(args)
         .output()
         .context("Для выбора файлов нужен kdialog")?;
     if !r.status.success() {

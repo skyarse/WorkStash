@@ -16,12 +16,13 @@ jobs:
     timeout-minutes: 45
     steps:
       - name: Install development tools
-        run: dnf -y install tar gzip git gcc gcc-c++ cargo rust rustfmt pkgconf-pkg-config rpm-build xorg-x11-server-Xvfb /usr/bin/xwininfo /usr/bin/xdpyinfo mesa-dri-drivers mesa-libEGL mesa-libGL libxkbcommon-x11 kdialog libsecret xdg-utils
+        run: dnf -y install tar gzip git gcc gcc-c++ cargo rust rustfmt pkgconf-pkg-config rpm-build xorg-x11-server-Xvfb /usr/bin/xwininfo /usr/bin/xdpyinfo mesa-dri-drivers mesa-libEGL mesa-libGL libxkbcommon-x11 kdialog libsecret xdg-utils python3-pyqt6 python3-markdown
       - uses: actions/checkout@v4
       - name: Check format and test
         run: |
           cargo fmt --check
           cargo test --locked
+          python3 -B tests/test_joplin.py
       - name: Build and package
         run: |
           cargo build --release --locked

@@ -1,11 +1,13 @@
 mod appearance;
 mod desktop;
+mod joplin;
 mod library;
 mod panel;
 mod remote;
 mod table;
 
 use anyhow::{Context, Result};
+use desktop::Picker;
 use eframe::egui::{self, Color32, RichText};
 use library::{Entry, Library};
 use panel::{OpenPanel, Panel};
@@ -115,6 +117,7 @@ struct App {
     draft: Option<Draft>,
     secret: String,
     server: Option<ServerPanel>,
+    joplin_jobs: Vec<mpsc::Receiver<Result<String>>>,
     status: String,
 }
 impl App {
@@ -150,13 +153,14 @@ impl App {
         self.moving.clear();
         self.draft = None;
         self.server = None;
+        self.joplin_jobs.clear();
         self.secret.clear();
         self.query.clear();
         self.status.clear();
         Ok(())
     }
     fn choose_library(&mut self) -> Result<()> {
-        if let Some(path) = desktop::choose(true)? {
+        if let Some(path) = desktop::choose(Picker::Folder)? {
             let path = if path.file_name().is_some_and(|s| s == "WorkStash.library")
                 && path.join("catalog.sqlite3").is_file()
             {
@@ -188,18 +192,74 @@ impl App {
             self.status = format!("{e:#}")
         }
     }
-    fn import(&mut self, paths: Vec<PathBuf>) -> Result<()> {
+    fn joplin_job(
+        &mut self,
+        ctx: &egui::Context,
+        work: impl FnOnce() -> Result<String> + Send + 'static,
+    ) {
+        let (tx, rx) = mpsc::channel();
+        self.joplin_jobs.push(rx);
+        let ctx = ctx.clone();
+        thread::spawn(move || {
+            let _ = tx.send(work());
+            ctx.request_repaint();
+        });
+    }
+    fn poll_joplin(&mut self) {
+        let mut messages = Vec::new();
+        self.joplin_jobs.retain(|rx| match rx.try_recv() {
+            Ok(Ok(message)) => {
+                if !message.is_empty() {
+                    messages.push(message);
+                }
+                false
+            }
+            Ok(Err(error)) => {
+                messages.push(format!("{error:#}"));
+                false
+            }
+            Err(mpsc::TryRecvError::Empty) => true,
+            Err(mpsc::TryRecvError::Disconnected) => {
+                messages.push("Работа с Joplin прервана".into());
+                false
+            }
+        });
+        if !messages.is_empty() {
+            self.status = messages.join("\n");
+            let r = self.reload();
+            self.report(r);
+        }
+    }
+    fn import(&mut self, paths: Vec<PathBuf>, ctx: &egui::Context) -> Result<()> {
         let lib = self.library.as_ref().context("Откройте библиотеку")?;
-        let mut failures = Vec::new();
+        let root = lib.root.clone();
+        let (archives, other): (Vec<_>, _) = paths.into_iter().partition(|p| joplin::is_archive(p));
+        let mut messages = Vec::new();
         let mut count = 0;
-        for p in paths {
+        for p in other {
             match lib.import(self.section.unwrap_or(1), &p) {
                 Ok(()) => count += 1,
-                Err(e) => failures.push(format!("{}: {e:#}", p.display())),
+                Err(e) => messages.push(format!("{}: {e:#}", p.display())),
             }
         }
-        self.reload()?;
-        self.status = format!("Добавлено: {count}. {}", failures.join("\n"));
+        if count > 0 {
+            self.reload()?;
+            messages.push(format!("Добавлено: {count}."));
+        }
+        if !archives.is_empty() {
+            messages.push("Импорт из Joplin…".into());
+            self.joplin_job(ctx, move || {
+                let messages = archives
+                    .iter()
+                    .map(|p| {
+                        joplin::import(&root, p)
+                            .unwrap_or_else(|e| format!("{}: {e:#}", p.display()))
+                    })
+                    .collect::<Vec<_>>();
+                Ok(messages.join("\n"))
+            });
+        }
+        self.status = messages.join("\n");
         Ok(())
     }
     fn new_draft(&mut self, kind: &str) {
@@ -263,19 +323,24 @@ impl App {
         }
         ui.add_space(12.);
         ui.label(RichText::new("Разделы").weak());
-        for (id, name) in &self.sections {
-            if ui
-                .selectable_label(self.section == Some(*id), name)
-                .clicked()
-            {
-                self.section = Some(*id);
-                self.selected = None;
-                self.kind_filter = None;
-                self.marked.clear();
-                self.selecting = false;
-                self.secret.clear();
-            }
-        }
+        egui::ScrollArea::vertical()
+            .id_salt("sections-list")
+            .max_height((ui.available_height() - 105.).max(50.))
+            .show(ui, |ui| {
+                for (id, name) in &self.sections {
+                    if ui
+                        .selectable_label(self.section == Some(*id), name)
+                        .clicked()
+                    {
+                        self.section = Some(*id);
+                        self.selected = None;
+                        self.kind_filter = None;
+                        self.marked.clear();
+                        self.selecting = false;
+                        self.secret.clear();
+                    }
+                }
+            });
         let button = ui.small_button("+ Раздел");
         self.trigger(&button, Panel::Section);
         ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
@@ -441,7 +506,13 @@ impl App {
         }
         self.trigger(&move_button, Panel::Move);
         let e = self.entries.iter().find(|e| e.id == id).unwrap();
-        if ["Заметка", "Промпт", "Credential"].contains(&e.kind.as_str()) {
+        if e.kind == "Joplin" && ui.button("Открыть с оформлением…").clicked()
+        {
+            let root = self.library.as_ref().unwrap().root.clone();
+            self.joplin_job(ctx, move || joplin::read(&root, id));
+            return;
+        }
+        if ["Заметка", "Промпт", "Credential", "Joplin"].contains(&e.kind.as_str()) {
             let button = ui.button("Редактировать");
             if let Some(panel) = &mut self.panel {
                 panel.track(&button);
@@ -459,7 +530,8 @@ impl App {
                 return;
             }
         }
-        if ["Заметка", "Промпт"].contains(&e.kind.as_str()) && ui.button("Скопировать").clicked()
+        if ["Заметка", "Промпт", "Joplin"].contains(&e.kind.as_str())
+            && ui.button("Скопировать").clicked()
         {
             ctx.copy_text(e.body.clone());
             self.status = "Текст скопирован".into();
@@ -571,7 +643,7 @@ impl App {
         });
         ui.label("Название");
         let mut changed = ui.text_edit_singleline(&mut d.title).changed();
-        if d.kind != "Credential" {
+        if matches!(d.kind.as_str(), "Заметка" | "Промпт") {
             let mut prompt = d.kind == "Промпт";
             if ui.checkbox(&mut prompt, "Промпт").changed() {
                 d.kind = if prompt {
@@ -764,12 +836,16 @@ impl App {
                 }
                 ui.separator();
                 ui.label(RichText::new("Импортировать").small());
-                for (label, folder) in [("Файл…", false), ("Папку…", true)] {
+                for (label, picker) in [
+                    ("Файл…", Picker::File),
+                    ("Папку…", Picker::Folder),
+                    ("Из Joplin (.jex)…", Picker::Joplin),
+                ] {
                     if ui.button(label).clicked() {
                         self.panel = None;
-                        let r = desktop::choose(folder).and_then(|path| {
+                        let r = desktop::choose(picker).and_then(|path| {
                             if let Some(path) = path {
-                                self.import(vec![path])
+                                self.import(vec![path], ctx)
                             } else {
                                 Ok(())
                             }
@@ -855,6 +931,7 @@ impl App {
             self.panel = None;
         }
         self.poll_server();
+        self.poll_joplin();
         if !self.status.is_empty() {
             egui::TopBottomPanel::bottom("status").show(ctx, |ui| {
                 ui.horizontal_wrapped(|ui| {
@@ -891,7 +968,7 @@ impl App {
                 .collect()
         });
         if !paths.is_empty() {
-            let r = self.import(paths);
+            let r = self.import(paths, ctx);
             self.report(r);
         }
         egui::SidePanel::left("sections")

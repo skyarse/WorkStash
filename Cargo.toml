@@ -22,7 +22,7 @@ url = "2"
 strip = true
 
 [package.metadata.generate-rpm]
-release = "0.3.dev"
+release = "0.4.dev"
 assets = [
     { source = "target/release/workstash", dest = "/usr/bin/workstash", mode = "755" },
     { source = "packaging/io.github.skyarse.WorkStash.desktop", dest = "/usr/share/applications/io.github.skyarse.WorkStash.desktop", mode = "644" },
@@ -33,3 +33,5 @@ assets = [
 kdialog = "*"
 libsecret = "*"
 xdg-utils = "*"
+python3-pyqt6 = "*"
+python3-markdown = "*"

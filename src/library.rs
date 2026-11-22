@@ -133,7 +133,7 @@ impl Library {
         ensure!(!title.trim().is_empty(), "Введите название");
         let tx = self.db.unchecked_transaction()?;
         let saved = if let Some(id) = id {
-            ensure!(tx.execute("UPDATE entries SET title=?,body=?,section=?,kind=? WHERE id=? AND ((kind IN ('Заметка','Промпт') AND ? IN ('Заметка','Промпт')) OR (kind='Credential' AND ?='Credential'))", params![title.trim(),body,section,kind,id,kind,kind])?==1,"Запись недоступна");
+            ensure!(tx.execute("UPDATE entries SET title=?,body=?,section=?,kind=? WHERE id=? AND ((kind IN ('Заметка','Промпт') AND ? IN ('Заметка','Промпт')) OR (kind IN ('Credential','Joplin') AND kind=?))", params![title.trim(),body,section,kind,id,kind,kind])?==1,"Запись недоступна");
             id
         } else {
             tx.execute(

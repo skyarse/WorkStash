@@ -17,6 +17,12 @@ Open an item and choose **Переместить в раздел…** to move it
 - In **+ Добавить → Из n8n…**, enter your server's HTTPS address and API key. Choose workflows or data tables, load the list and select an item to save an offline JSON snapshot. Table snapshots include metadata and rows. Re-selecting an item from that server updates its catalog entry. Select a saved table to browse its columns and rows offline. CSV imports use the same paged viewer. Older snapshot files remain on disk. Data table access requires a server version exposing the public data table endpoints.
 - Create a **Карточка доступа** entry using the credential name shown in a workflow to see name matches. Identical names across servers can match multiple workflows. To store a password or token, open that card and enter it in the separate secret field. WorkStash uses the desktop Secret Service through `secret-tool`. A working, unlocked Secret Service collection is required. Copying a secret puts it on the system clipboard.
 
+## Importing a Joplin library
+
+In Joplin, export all notebooks together as one JEX archive. In WorkStash, select **+ Добавить → Из Joplin (.jex)…** or drop the file on the catalog. Notebooks become sections, nested notebook paths appear with **›**, and notes and to-dos become editable Joplin entries. Identical archives are skipped. A different export imports a separate collection, with numbered section names on collisions.
+
+Select **Открыть с оформлением…** to read Markdown or HTML in a native Qt window, navigate note links and view local images. Select **Поля заметки…** for metadata, dates and tags. WorkStash keeps the original JEX and bundled attachments under the library's files directory. The reader uses local fonts and Qt rich text. Global Joplin theme CSS and plugin rendering are outside this format. Download attachments in Joplin and unlock protected notes before exporting them.
+
 ## Storage
 
 The catalog and imported files stay on the selected disk. Workflow JSON and data table snapshots retain their original contents and may contain sensitive fields. Treat the library as private. Back up the whole library folder with the app closed. Manually entered secrets are stored separately in your desktop keyring, which needs its own backup. The n8n API key stays in memory while its connection dialog is open.
