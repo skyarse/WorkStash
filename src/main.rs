@@ -1,6 +1,8 @@
+mod appearance;
 mod desktop;
 mod library;
 mod remote;
+mod table;
 
 use anyhow::{Context, Result};
 use eframe::egui::{self, Color32, RichText};
@@ -14,6 +16,26 @@ use std::{
     thread,
 };
 
+fn kind_name(kind: &str) -> &str {
+    if kind == "Credential" {
+        "Карточка доступа"
+    } else {
+        kind
+    }
+}
+fn tab_name(kind: &str) -> &str {
+    match kind {
+        "Таблица" => "Таблицы",
+        "Заметка" => "Заметки",
+        "Промпт" => "Промпты",
+        "Credential" => "Доступы",
+        "Навык" => "Навыки",
+        "Папка" => "Папки",
+        "Документ" => "Документы",
+        "Файл" => "Файлы",
+        other => other,
+    }
+}
 fn config_file() -> Option<PathBuf> {
     std::env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
@@ -68,6 +90,10 @@ impl ServerPanel {
 }
 #[derive(Default)]
 struct App {
+    appearance: Option<appearance::Appearance>,
+    settings_open: bool,
+    kind_filter: Option<String>,
+    table: Option<(String, Result<table::Table>)>,
     library: Option<Library>,
     entries: Vec<Entry>,
     sections: Vec<(i64, String)>,
@@ -82,8 +108,11 @@ struct App {
     status: String,
 }
 impl App {
-    fn new() -> Self {
-        let mut app = Self::default();
+    fn new(ctx: &egui::Context) -> Self {
+        let mut app = Self {
+            appearance: Some(appearance::Appearance::new(ctx)),
+            ..Self::default()
+        };
         if let Some(path) = config_file().and_then(|p| fs::read_to_string(p).ok()) {
             let parent = Path::new(&path);
             if parent.join("WorkStash.library/catalog.sqlite3").is_file() {
@@ -103,6 +132,8 @@ impl App {
         self.sections = sections;
         self.selected = None;
         self.section = None;
+        self.kind_filter = None;
+        self.table = None;
         self.draft = None;
         self.server = None;
         self.secret.clear();
@@ -175,6 +206,7 @@ impl App {
         {
             self.section = None;
             self.selected = None;
+            self.kind_filter = None;
             self.secret.clear();
         }
         ui.add_space(12.);
@@ -186,6 +218,7 @@ impl App {
             {
                 self.section = Some(*id);
                 self.selected = None;
+                self.kind_filter = None;
                 self.secret.clear();
             }
         }
@@ -203,6 +236,7 @@ impl App {
                     .and_then(|id| {
                         self.section = Some(id);
                         self.selected = None;
+                        self.kind_filter = None;
                         self.secret.clear();
                         self.section_name.clear();
                         self.adding_section = false;
@@ -216,42 +250,96 @@ impl App {
                 let r = self.choose_library();
                 self.report(r);
             }
-            if ui.button("Подключить n8n…").clicked() {
-                self.server.get_or_insert_with(Default::default);
+            if ui.button("Настройки…").clicked() {
+                self.settings_open = true;
             }
         });
     }
     fn catalog(&mut self, ui: &mut egui::Ui) {
-        ui.heading(
-            self.sections
+        ui.horizontal(|ui| {
+            let section = self
+                .sections
                 .iter()
-                .find(|(id, _)| Some(*id) == self.section)
+                .find(|s| Some(s.0) == self.section)
                 .map(|s| s.1.as_str())
-                .unwrap_or("Все материалы"),
-        );
+                .unwrap_or("Все материалы");
+            ui.heading(section);
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.menu_button("+ Добавить", |ui| {
+                    ui.label(RichText::new("Создать").small());
+                    for kind in ["Заметка", "Промпт", "Credential"] {
+                        if ui.button(kind_name(kind)).clicked() {
+                            ui.close_menu();
+                            self.new_draft(kind);
+                        }
+                    }
+                    ui.separator();
+                    ui.label(RichText::new("Импортировать").small());
+                    for (label, folder) in [("Файл…", false), ("Папку…", true)] {
+                        if ui.button(label).clicked() {
+                            ui.close_menu();
+                            let r = desktop::choose(folder).and_then(|path| {
+                                if let Some(path) = path {
+                                    self.import(vec![path])
+                                } else {
+                                    Ok(())
+                                }
+                            });
+                            self.report(r);
+                        }
+                    }
+                    if ui.button("Из n8n…").clicked() {
+                        ui.close_menu();
+                        self.server.get_or_insert_with(Default::default);
+                    }
+                });
+            });
+        });
         ui.add_space(8.);
         ui.add(
             egui::TextEdit::singleline(&mut self.query)
                 .hint_text("Поиск по названию и содержимому")
                 .desired_width(f32::INFINITY),
         );
-        ui.add_space(8.);
-        ui.horizontal_wrapped(|ui| {
-            for k in ["Заметка", "Промпт", "Credential"] {
-                if ui.button(format!("+ {k}")).clicked() {
-                    self.new_draft(k);
+        let kinds: std::collections::BTreeSet<_> = self
+            .entries
+            .iter()
+            .filter(|e| self.section.is_none_or(|s| e.section == s))
+            .map(|e| e.kind.as_str())
+            .collect();
+        if self
+            .kind_filter
+            .as_deref()
+            .is_some_and(|k| !kinds.contains(k))
+        {
+            self.kind_filter = None;
+        }
+        if !kinds.is_empty() {
+            ui.horizontal_wrapped(|ui| {
+                if ui
+                    .selectable_label(self.kind_filter.is_none(), "Все")
+                    .clicked()
+                {
+                    self.kind_filter = None;
                 }
-            }
-            for (name, folder) in [("Файл…", false), ("Папка…", true)] {
-                if ui.button(name).clicked() {
-                    let r = desktop::choose(folder).and_then(|p| match p {
-                        Some(path) => self.import(vec![path]),
-                        None => Ok(()),
-                    });
-                    self.report(r);
+                for kind in kinds {
+                    if ui
+                        .selectable_label(self.kind_filter.as_deref() == Some(kind), tab_name(kind))
+                        .clicked()
+                    {
+                        self.kind_filter = Some(kind.to_owned());
+                        if self
+                            .entries
+                            .iter()
+                            .any(|e| Some(e.id) == self.selected && e.kind != kind)
+                        {
+                            self.selected = None;
+                            self.secret.clear();
+                        }
+                    }
                 }
-            }
-        });
+            });
+        }
         ui.separator();
         let q = self.query.trim().to_lowercase();
         let mut any = false;
@@ -260,15 +348,17 @@ impl App {
             .show(ui, |ui| {
                 for e in &self.entries {
                     if self.section.is_some_and(|s| s != e.section)
+                        || self.kind_filter.as_ref().is_some_and(|k| k != &e.kind)
                         || !(q.is_empty()
                             || e.title.to_lowercase().contains(&q)
+                            || kind_name(&e.kind).to_lowercase().contains(&q)
                             || e.kind.to_lowercase().contains(&q)
                             || e.body.to_lowercase().contains(&q))
                     {
                         continue;
                     }
                     any = true;
-                    ui.label(RichText::new(&e.kind).small().weak());
+                    ui.label(RichText::new(kind_name(&e.kind)).small());
                     if ui
                         .selectable_label(
                             self.selected == Some(e.id),
@@ -294,7 +384,7 @@ impl App {
         let Some(e) = self.entries.iter().find(|e| Some(e.id) == self.selected) else {
             return;
         };
-        ui.label(RichText::new(&e.kind).weak());
+        ui.label(RichText::new(kind_name(&e.kind)));
         ui.heading(&e.title);
         ui.add_space(10.);
         if ["Заметка", "Промпт", "Credential"].contains(&e.kind.as_str())
@@ -316,11 +406,7 @@ impl App {
             let root = &self.library.as_ref().unwrap().root;
             if ui.button("Показать в файловом менеджере").clicked() {
                 let r = (|| -> Result<()> {
-                    let path = root.join(relative).canonicalize()?;
-                    anyhow::ensure!(
-                        path.starts_with(root.join("files")),
-                        "Копия находится вне библиотеки"
-                    );
+                    let path = table::asset_path(root, relative)?;
                     let dir = if path.is_dir() {
                         path.as_path()
                     } else {
@@ -380,12 +466,36 @@ impl App {
                         })
             }) {
                 if ui.link(&w.title).clicked() {
+                    self.section = Some(w.section);
+                    self.kind_filter = Some(w.kind.clone());
+                    self.query.clear();
                     self.selected = Some(w.id);
                     self.secret.clear();
                 }
             }
         }
         ui.separator();
+        if e.kind == "Таблица" {
+            if let Some(path) = &e.asset {
+                if self.table.as_ref().is_none_or(|(key, _)| key != path) {
+                    self.table = Some((
+                        path.clone(),
+                        table::Table::open(&self.library.as_ref().unwrap().root, path),
+                    ));
+                }
+                ui.push_id(e.id, |ui| match &mut self.table.as_mut().unwrap().1 {
+                    Ok(table) => {
+                        if let Err(err) = table.show(ui) {
+                            self.status = format!("Не удалось открыть страницу: {err:#}");
+                        }
+                    }
+                    Err(err) => {
+                        ui.label(format!("Не удалось прочитать таблицу: {err:#}"));
+                    }
+                });
+                return;
+            }
+        }
         egui::ScrollArea::vertical().id_salt("body").show(ui, |ui| {
             ui.label(&e.body);
         });
@@ -394,7 +504,7 @@ impl App {
         let Some(d) = self.draft.as_mut() else { return };
         let mut save = false;
         let mut open = true;
-        egui::Window::new(format!("{} · запись", d.kind))
+        egui::Window::new(format!("{} · запись", kind_name(&d.kind)))
             .open(&mut open)
             .collapsible(false)
             .default_width(450.)
@@ -437,6 +547,7 @@ impl App {
             {
                 Ok(id) => {
                     self.section = Some(d.section);
+                    self.kind_filter = Some(d.kind.clone());
                     self.selected = Some(id);
                     self.secret.clear();
                     self.query.clear();
@@ -565,6 +676,18 @@ impl App {
 }
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _: &mut eframe::Frame) {
+        if let Some(appearance) = &mut self.appearance {
+            appearance.apply(ctx);
+            egui::Window::new("Настройки")
+                .open(&mut self.settings_open)
+                .collapsible(false)
+                .resizable(false)
+                .show(ctx, |ui| {
+                    if let Err(err) = appearance.settings(ui) {
+                        self.status = format!("Не удалось сохранить тему: {err:#}");
+                    }
+                });
+        }
         if !self.status.is_empty() {
             egui::TopBottomPanel::bottom("status").show(ctx, |ui| {
                 ui.horizontal_wrapped(|ui| {
@@ -581,6 +704,9 @@ impl eframe::App for App {
                     ui.add_space(100.);
                     ui.heading("WorkStash");
                     ui.add_space(16.);
+                    if ui.button("Настройки…").clicked() {
+                        self.settings_open = true;
+                    }
                     ui.label("Выберите папку для новой или существующей библиотеки.");
                     if ui.button("Выбрать папку…").clicked() {
                         let r = self.choose_library();
@@ -627,11 +753,100 @@ fn main() -> eframe::Result {
         "WorkStash",
         options,
         Box::new(|cc| {
-            cc.egui_ctx.style_mut(|s| {
+            cc.egui_ctx.all_styles_mut(|s| {
                 s.spacing.item_spacing = egui::vec2(9., 8.);
-                s.visuals.selection.bg_fill = Color32::from_rgb(59, 100, 130);
+                if s.visuals.dark_mode {
+                    s.visuals.widgets.noninteractive.fg_stroke.color = Color32::from_gray(210);
+                    s.visuals.selection.bg_fill = Color32::from_rgb(52, 88, 115);
+                }
             });
-            Ok(Box::new(App::new()))
+            Ok(Box::new(App::new(&cc.egui_ctx)))
         }),
     )
+}
+
+#[cfg(test)]
+mod ui_tests {
+    use super::*;
+
+    fn catalog_frame(
+        app: &mut App,
+        ctx: &egui::Context,
+        events: Vec<egui::Event>,
+    ) -> Vec<(String, egui::Pos2)> {
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(950., 650.),
+            )),
+            events,
+            ..Default::default()
+        };
+        ctx.run(input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| app.catalog(ui));
+        })
+        .shapes
+        .into_iter()
+        .filter_map(|s| {
+            if let egui::Shape::Text(text) = s.shape {
+                Some((
+                    text.galley.job.text.clone(),
+                    text.visual_bounding_rect().center(),
+                ))
+            } else {
+                None
+            }
+        })
+        .collect()
+    }
+
+    #[test]
+    fn table_tab_filters_existing_workflow_and_search() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let lib = Library::open(dir.path())?;
+        let section = lib.add_section("n8n")?;
+        lib.snapshot(
+            section,
+            "Workflow",
+            "wf",
+            "Пример workflow",
+            &serde_json::json!({"nodes":[]}),
+        )?;
+        lib.snapshot(
+            section,
+            "Таблица",
+            "tb",
+            "Пример таблицы",
+            &serde_json::json!({"rows":[]}),
+        )?;
+        drop(lib);
+        let mut app = App::default();
+        app.load(dir.path())?;
+        app.section = Some(section);
+        app.query = "пример".into();
+        let ctx = egui::Context::default();
+        let labels = catalog_frame(&mut app, &ctx, vec![]);
+        assert!(labels.iter().any(|(s, _)| s == "Пример workflow"));
+        let pos = labels.iter().find(|(s, _)| s == "Таблицы").unwrap().1;
+        for pressed in [true, false] {
+            catalog_frame(
+                &mut app,
+                &ctx,
+                vec![
+                    egui::Event::PointerMoved(pos),
+                    egui::Event::PointerButton {
+                        pos,
+                        button: egui::PointerButton::Primary,
+                        pressed,
+                        modifiers: Default::default(),
+                    },
+                ],
+            );
+        }
+        let labels = catalog_frame(&mut app, &ctx, vec![]);
+        assert_eq!(app.kind_filter.as_deref(), Some("Таблица"));
+        assert!(labels.iter().any(|(s, _)| s == "Пример таблицы"));
+        assert!(!labels.iter().any(|(s, _)| s == "Пример workflow"));
+        Ok(())
+    }
 }

@@ -9,6 +9,8 @@ license = "GPL-3.0-only"
 
 [dependencies]
 anyhow = "1"
+csv = "1"
+mundy = { version = "0.2.3", default-features = false, features = ["color-scheme", "callback", "async-io"] }
 eframe = { version = "0.31.1", default-features = false, features = ["default_fonts", "glow", "wayland", "x11"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
 serde_json = "1"
@@ -20,7 +22,7 @@ url = "2"
 strip = true
 
 [package.metadata.generate-rpm]
-release = "0.1.dev"
+release = "0.2.dev"
 assets = [
     { source = "target/release/workstash", dest = "/usr/bin/workstash", mode = "755" },
     { source = "packaging/io.github.skyarse.WorkStash.desktop", dest = "/usr/share/applications/io.github.skyarse.WorkStash.desktop", mode = "644" },
