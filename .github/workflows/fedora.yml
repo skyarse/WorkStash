@@ -1,0 +1,48 @@
+name: Fedora development build
+on:
+  push:
+    branches: [dev]
+  pull_request:
+    branches: [dev]
+permissions:
+  contents: read
+concurrency:
+  group: fedora-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container: fedora:44
+    timeout-minutes: 45
+    steps:
+      - name: Install development tools
+        run: dnf -y install tar gzip git gcc gcc-c++ cargo rust rustfmt pkgconf-pkg-config rpm-build xorg-x11-server-Xvfb /usr/bin/xwininfo /usr/bin/xdpyinfo mesa-dri-drivers mesa-libEGL mesa-libGL libxkbcommon-x11 kdialog libsecret xdg-utils
+      - uses: actions/checkout@v4
+      - name: Check format and test
+        run: |
+          cargo fmt --check
+          cargo test --locked
+      - name: Build and package
+        run: |
+          cargo build --release --locked
+          cargo install cargo-generate-rpm --version 0.21.1 --locked
+          "${CARGO_HOME:-$HOME/.cargo}/bin/cargo-generate-rpm" generate-rpm
+          dnf -y install ./target/generate-rpm/*.rpm
+      - name: Open the installed application
+        run: |
+          Xvfb :19 -screen 0 1280x800x24 -nolisten tcp &
+          export DISPLAY=:19
+          for i in $(seq 1 30); do xdpyinfo >/dev/null 2>&1 && break; sleep 1; done
+          workstash &
+          app=$!
+          for i in $(seq 1 30); do
+            if xwininfo -root -tree | grep -q '"WorkStash"'; then kill "$app"; exit 0; fi
+            kill -0 "$app" || exit 1
+            sleep 1
+          done
+          exit 1
+      - uses: actions/upload-artifact@v4
+        with:
+          name: WorkStash-Fedora44-x86_64
+          path: target/generate-rpm/*.rpm
+          if-no-files-found: error

@@ -1,0 +1,33 @@
+[package]
+name = "workstash"
+version = "0.1.0"
+edition = "2021"
+description = "A local workspace for notes, prompts, workflows and project files"
+repository = "https://github.com/skyarse/WorkStash"
+publish = false
+license = "GPL-3.0-only"
+
+[dependencies]
+anyhow = "1"
+eframe = { version = "0.31.1", default-features = false, features = ["default_fonts", "glow", "wayland", "x11"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
+serde_json = "1"
+tempfile = "3"
+ureq = { version = "2.12", features = ["json"] }
+url = "2"
+
+[profile.release]
+strip = true
+
+[package.metadata.generate-rpm]
+release = "0.1.dev"
+assets = [
+    { source = "target/release/workstash", dest = "/usr/bin/workstash", mode = "755" },
+    { source = "packaging/io.github.skyarse.WorkStash.desktop", dest = "/usr/share/applications/io.github.skyarse.WorkStash.desktop", mode = "644" },
+    { source = "LICENSE", dest = "/usr/share/licenses/workstash/LICENSE", mode = "644", doc = true },
+]
+
+[package.metadata.generate-rpm.requires]
+kdialog = "*"
+libsecret = "*"
+xdg-utils = "*"

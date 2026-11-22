@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=WorkStash
+Comment=Organize notes, prompts, workflows and project files
+Comment[ru]=Храните заметки, промпты, workflow и файлы проектов
+Exec=workstash
+Icon=folder-documents
+Terminal=false
+Categories=Office;Utility;
+StartupWMClass=WorkStash
