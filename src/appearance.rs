@@ -1,5 +1,5 @@
 use anyhow::Result;
-use eframe::egui::{self, ThemePreference};
+use eframe::egui::{self, Color32, FontId, Stroke, ThemePreference};
 use std::{fs, path::Path, sync::mpsc};
 
 const CHOICES: [(ThemePreference, &str, &str); 3] = [
@@ -7,6 +7,98 @@ const CHOICES: [(ThemePreference, &str, &str); 3] = [
     (ThemePreference::Light, "Светлая", "light"),
     (ThemePreference::Dark, "Тёмная", "dark"),
 ];
+
+pub fn configure(ctx: &egui::Context) {
+    ctx.all_styles_mut(|style| {
+        style.spacing.item_spacing = egui::vec2(8., 7.);
+        style.spacing.button_padding = egui::vec2(10., 5.);
+        style.spacing.interact_size.y = 29.;
+        style
+            .text_styles
+            .insert(egui::TextStyle::Heading, FontId::proportional(22.));
+        style
+            .text_styles
+            .insert(egui::TextStyle::Body, FontId::proportional(14.));
+        style
+            .text_styles
+            .insert(egui::TextStyle::Button, FontId::proportional(13.));
+        style
+            .text_styles
+            .insert(egui::TextStyle::Small, FontId::proportional(12.));
+
+        let colors = &mut style.visuals;
+        let (main, panel, raised, hover, border, text, accent) = if colors.dark_mode {
+            (
+                [19, 24, 32],
+                [24, 31, 40],
+                [31, 40, 51],
+                [42, 55, 68],
+                [51, 64, 78],
+                [225, 233, 241],
+                [41, 83, 86],
+            )
+        } else {
+            (
+                [251, 252, 253],
+                [240, 244, 247],
+                [245, 248, 250],
+                [225, 237, 240],
+                [213, 223, 230],
+                [30, 44, 58],
+                [199, 233, 227],
+            )
+        };
+        let rgb = |[r, g, b]: [u8; 3]| Color32::from_rgb(r, g, b);
+        colors.panel_fill = rgb(main);
+        colors.window_fill = rgb(panel);
+        colors.window_stroke = Stroke::new(1.0_f32, rgb(border));
+        colors.extreme_bg_color = rgb(main);
+        colors.faint_bg_color = rgb(raised);
+        colors.selection.bg_fill = rgb(accent);
+        colors.selection.stroke = Stroke::new(
+            1.0_f32,
+            if colors.dark_mode {
+                Color32::from_rgb(104, 168, 164)
+            } else {
+                Color32::from_rgb(82, 133, 130)
+            },
+        );
+        for widget in [
+            &mut colors.widgets.noninteractive,
+            &mut colors.widgets.inactive,
+            &mut colors.widgets.hovered,
+            &mut colors.widgets.active,
+            &mut colors.widgets.open,
+        ] {
+            widget.corner_radius = 7.into();
+            widget.fg_stroke.color = rgb(text);
+            widget.expansion = 0.;
+        }
+        colors.widgets.noninteractive.bg_stroke.color = rgb(border);
+        colors.widgets.inactive.bg_fill = rgb(raised);
+        colors.widgets.inactive.weak_bg_fill = rgb(raised);
+        colors.widgets.inactive.bg_stroke = Stroke::NONE;
+        colors.widgets.hovered.bg_fill = rgb(hover);
+        colors.widgets.hovered.weak_bg_fill = rgb(hover);
+        colors.widgets.hovered.bg_stroke = Stroke::new(1.0_f32, rgb(border));
+        colors.widgets.active.bg_fill = rgb(accent);
+        colors.widgets.active.weak_bg_fill = rgb(accent);
+    });
+}
+
+pub fn primary_button(ui: &egui::Ui, label: &'static str) -> egui::Button<'static> {
+    egui::Button::new(egui::RichText::new(label).strong())
+        .corner_radius(7)
+        .fill(ui.visuals().selection.bg_fill)
+}
+
+pub fn secondary_text(ui: &egui::Ui) -> Color32 {
+    if ui.visuals().dark_mode {
+        Color32::from_rgb(169, 185, 200)
+    } else {
+        Color32::from_rgb(82, 100, 117)
+    }
+}
 
 pub struct Appearance {
     preference: ThemePreference,

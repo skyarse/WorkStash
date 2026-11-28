@@ -24,6 +24,7 @@ pub struct Entry {
     pub body: String,
     pub asset: Option<String>,
     pub token: String,
+    pub favorite: bool,
 }
 
 impl Library {
@@ -46,6 +47,7 @@ impl Library {
               asset TEXT,source TEXT UNIQUE,token TEXT NOT NULL UNIQUE DEFAULT (lower(hex(randomblob(16))))
             );
             CREATE TABLE IF NOT EXISTS drafts(slot TEXT PRIMARY KEY,section INTEGER NOT NULL,kind TEXT NOT NULL,title TEXT NOT NULL,body TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS favorites(entry INTEGER PRIMARY KEY REFERENCES entries(id) ON DELETE CASCADE);
             COMMIT;")?;
         Ok(Self { root, db })
     }
@@ -63,9 +65,23 @@ impl Library {
             .context("Не удалось создать раздел. Проверьте, свободно ли название")?;
         Ok(self.db.last_insert_rowid())
     }
+    pub fn rename_section(&self, id: i64, name: &str) -> Result<()> {
+        ensure!(!name.trim().is_empty(), "Введите название раздела");
+        ensure!(id != 1, "Раздел «Входящие» нельзя переименовать");
+        let affected = self
+            .db
+            .execute(
+                "UPDATE sections SET name=? WHERE id=?",
+                params![name.trim(), id],
+            )
+            .context("Не удалось переименовать раздел. Проверьте, свободно ли название")?;
+        ensure!(affected == 1, "Раздел недоступен");
+        Ok(())
+    }
     pub fn entries(&self) -> Result<Vec<Entry>> {
         let mut stmt = self.db.prepare(
-            "SELECT id,section,kind,title,body,asset,token FROM entries ORDER BY id DESC",
+            "SELECT e.id,e.section,e.kind,e.title,e.body,e.asset,e.token,f.entry IS NOT NULL
+             FROM entries e LEFT JOIN favorites f ON f.entry=e.id ORDER BY e.id DESC",
         )?;
         let rows = stmt.query_map([], |r| {
             Ok(Entry {
@@ -76,9 +92,20 @@ impl Library {
                 body: r.get(4)?,
                 asset: r.get(5)?,
                 token: r.get(6)?,
+                favorite: r.get(7)?,
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+    pub fn set_favorite(&self, id: i64, favorite: bool) -> Result<()> {
+        if favorite {
+            self.db
+                .execute("INSERT OR IGNORE INTO favorites(entry) VALUES(?)", [id])?;
+        } else {
+            self.db
+                .execute("DELETE FROM favorites WHERE entry=?", [id])?;
+        }
+        Ok(())
     }
     pub fn move_entries(&mut self, ids: &[i64], section: i64) -> Result<()> {
         let tx = self.db.transaction()?;
@@ -415,6 +442,39 @@ mod organization_tests {
         assert!(lib.entries()?.iter().all(|e| e.section == section));
         lib.save_text(None, section, "Промпт", "Новый", "Готово")?;
         assert!(lib.draft(&new_slot)?.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn existing_catalog_keeps_materials_and_persists_favorites_and_section_names() -> Result<()> {
+        let folder = tempfile::tempdir()?;
+        let library = Library::open(folder.path())?;
+        let section = library.add_section("Старый раздел")?;
+        let id = library.save_text(None, section, "Заметка", "Старая запись", "Текст")?;
+        let token = library.entries()?[0].token.clone();
+        library.db.execute("DROP TABLE favorites", [])?;
+        drop(library);
+
+        let library = Library::open(folder.path())?;
+        assert!(!library.entries()?[0].favorite);
+        library.set_favorite(id, true)?;
+        library.rename_section(section, "Новый раздел")?;
+        assert!(library.rename_section(1, "Другое имя").is_err());
+        drop(library);
+
+        let library = Library::open(folder.path())?;
+        let entries = library.entries()?;
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].id, id);
+        assert_eq!(entries[0].token, token);
+        assert_eq!(entries[0].body, "Текст");
+        assert_eq!(entries[0].section, section);
+        assert!(entries[0].favorite);
+        assert!(library
+            .sections()?
+            .contains(&(section, "Новый раздел".into())));
+        library.set_favorite(id, false)?;
+        assert!(!library.entries()?[0].favorite);
         Ok(())
     }
 }

@@ -7,6 +7,7 @@ pub enum Panel {
     Server,
     Settings,
     Section,
+    RenameSection,
     Move,
 }
 
